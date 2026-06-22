@@ -28,6 +28,8 @@ export default function Room() {
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const cameraTrackRef = useRef(null); // remember original camera track during screen share
+  const micTrackRef = useRef(null);
+  const audioContextRef = useRef(null);
 
   // ---- Helpers --------------------------------------------------------
   const upsertPeer = (id, data) => {
@@ -184,6 +186,13 @@ export default function Room() {
       if (sender) sender.replaceTrack(newTrack);
     });
   };
+  const replaceAudioTrackOnAllPeers = (newTrack) => {
+    Object.values(peersRef.current).forEach(({ pc }) => {
+      if (!pc) return;
+      const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
+      if (sender) sender.replaceTrack(newTrack);
+    });
+  };
 
   const startScreenShare = async () => {
     try {
@@ -192,23 +201,45 @@ export default function Room() {
         audio: true,
       });
       screenStreamRef.current = screen;
-      const screenTrack = screen.getVideoTracks()[0];
+      const screenVideoTrack = screen.getVideoTracks()[0];
+      const screenAudioTrack = screen.getAudioTracks()[0]; // undefined if nothing was shared
 
-      // remember the original camera track so we can restore it
       cameraTrackRef.current = localStreamRef.current?.getVideoTracks()[0] || null;
+      micTrackRef.current = localStreamRef.current?.getAudioTracks()[0] || null;
 
-      replaceVideoTrackOnAllPeers(screenTrack);
+      replaceVideoTrackOnAllPeers(screenVideoTrack);
 
-      // Also reflect locally
-      const newLocal = new MediaStream([
-        screenTrack,
-        ...(localStreamRef.current?.getAudioTracks() || []),
-      ]);
+      let outgoingAudioTrack = micTrackRef.current;
+
+      if (screenAudioTrack) {
+        // Mix your mic + the shared tab/system audio into one track,
+        // so your friend hears the movie AND you talking, on the same
+        // audio channel that's already connected (no renegotiation needed).
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const destination = ctx.createMediaStreamDestination();
+
+        if (micTrackRef.current) {
+          ctx.createMediaStreamSource(new MediaStream([micTrackRef.current])).connect(destination);
+        }
+        ctx.createMediaStreamSource(new MediaStream([screenAudioTrack])).connect(destination);
+
+        audioContextRef.current = ctx;
+        outgoingAudioTrack = destination.stream.getAudioTracks()[0];
+      } else {
+        console.warn(
+          "No audio was captured from the share — your friend will only hear your mic, not the movie. " +
+          "Pick 'Chrome Tab' in the share dialog and check 'Share tab audio'."
+        );
+      }
+
+      replaceAudioTrackOnAllPeers(outgoingAudioTrack);
+
+      const newLocal = new MediaStream([screenVideoTrack, outgoingAudioTrack].filter(Boolean));
       localStreamRef.current = newLocal;
       setLocalStream(newLocal);
       setSharing(true);
 
-      screenTrack.onended = () => stopScreenShare();
+      screenVideoTrack.onended = () => stopScreenShare();
     } catch (err) {
       console.warn("Screen share cancelled", err);
     }
@@ -217,6 +248,11 @@ export default function Room() {
   const stopScreenShare = async () => {
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current = null;
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
 
     let camTrack = cameraTrackRef.current;
     if (!camTrack || camTrack.readyState === "ended") {
@@ -227,11 +263,20 @@ export default function Room() {
         camTrack = null;
       }
     }
-
     if (camTrack) replaceVideoTrackOnAllPeers(camTrack);
 
-    const audio = localStreamRef.current?.getAudioTracks() || [];
-    const newLocal = new MediaStream(camTrack ? [camTrack, ...audio] : audio);
+    let micTrack = micTrackRef.current;
+    if (!micTrack || micTrack.readyState === "ended") {
+      try {
+        const fresh = await navigator.mediaDevices.getUserMedia({ audio: true });
+        micTrack = fresh.getAudioTracks()[0];
+      } catch {
+        micTrack = null;
+      }
+    }
+    if (micTrack) replaceAudioTrackOnAllPeers(micTrack);
+
+    const newLocal = new MediaStream([camTrack, micTrack].filter(Boolean));
     localStreamRef.current = newLocal;
     setLocalStream(newLocal);
     setSharing(false);
