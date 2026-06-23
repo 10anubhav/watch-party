@@ -70,7 +70,9 @@ export default function Room() {
   const [copied, setCopied] = useState(false);
 
   const peersRef = useRef({}); // mirror of peers state for sync access
+  const peerStreamsRef = useRef({});
   const pendingIceRef = useRef({}); // socketId -> RTCIceCandidateInit[]
+  const pendingNegotiationRef = useRef(new Set());
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const screenAudioTrackRef = useRef(null);
@@ -88,7 +90,10 @@ export default function Room() {
   const removePeer = (id) => {
     const p = peersRef.current[id];
     if (p?.pc) p.pc.close();
+    const existingStream = peerStreamsRef.current[id];
+    existingStream?.getTracks().forEach((track) => track.stop());
     delete pendingIceRef.current[id];
+    delete peerStreamsRef.current[id];
     delete peersRef.current[id];
     setPeers({ ...peersRef.current });
   };
@@ -251,8 +256,76 @@ export default function Room() {
 
   const refreshSharedAudio = async (includeMic = micOn) => {
     const outgoingAudioTrack = await createSharedAudioTrack(includeMic);
-    replaceAudioTrackOnAllPeers(outgoingAudioTrack);
+    await replaceAudioTrackOnAllPeers(outgoingAudioTrack);
     setLocalTracks(screenStreamRef.current?.getVideoTracks()[0], outgoingAudioTrack);
+  };
+
+  const negotiatePeer = async (remoteId) => {
+    const peer = peersRef.current[remoteId];
+    const pc = peer?.pc;
+    if (!pc || pendingNegotiationRef.current.has(remoteId)) {
+      console.log(`[${remoteId}] Skipping negotiation: pc=${!!pc}, pending=${pendingNegotiationRef.current.has(remoteId)}`);
+      return;
+    }
+
+    if (!pc.localDescription && !pc.remoteDescription) {
+      console.log(`[${remoteId}] Skipping negotiation: no local or remote description yet`);
+      return;
+    }
+
+    if (pc.signalingState === "closed") {
+      console.log(`[${remoteId}] Skipping negotiation: connection closed`);
+      return;
+    }
+
+    pendingNegotiationRef.current.add(remoteId);
+    try {
+      const mySocketId = socket.id || "";
+      const shouldCreateOffer = mySocketId < remoteId;
+      console.log(`[${remoteId}] Renegotiating. signalingState=${pc.signalingState}, shouldCreateOffer=${shouldCreateOffer}`);
+
+      if (shouldCreateOffer) {
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          console.log(`[${remoteId}] Sent offer`);
+          socket.emit("sending-signal", {
+            userToSignal: remoteId,
+            signal: pc.localDescription,
+          });
+        } catch (err) {
+          console.warn(`[${remoteId}] Offer failed, fallback to answer`, err.message);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit("returning-signal", {
+            callerId: remoteId,
+            signal: pc.localDescription,
+          });
+        }
+      } else {
+        try {
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          console.log(`[${remoteId}] Sent answer`);
+          socket.emit("returning-signal", {
+            callerId: remoteId,
+            signal: pc.localDescription,
+          });
+        } catch (err) {
+          console.warn(`[${remoteId}] Answer failed, fallback to offer`, err.message);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit("sending-signal", {
+            userToSignal: remoteId,
+            signal: pc.localDescription,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(`[${remoteId}] Renegotiation completely failed:`, err.message);
+    } finally {
+      pendingNegotiationRef.current.delete(remoteId);
+    }
   };
 
   const createPeerConnection = (remoteId, remoteName) => {
@@ -279,8 +352,33 @@ export default function Room() {
     };
 
     pc.ontrack = (e) => {
-      const stream = e.streams[0] || new MediaStream([e.track]);
-      upsertPeer(remoteId, { stream, username: remoteName });
+      console.log(`[${remoteId}] ontrack fired. Tracks in stream:`, e.streams[0]?.getTracks().map(t => `${t.kind}(${t.id})`));
+      const incomingStream = e.streams[0] || new MediaStream();
+      const existingStream = peerStreamsRef.current[remoteId] || incomingStream;
+
+      if (!peerStreamsRef.current[remoteId]) {
+        console.log(`[${remoteId}] Created new peer stream`);
+        peerStreamsRef.current[remoteId] = existingStream;
+      }
+
+      incomingStream.getTracks().forEach((track) => {
+        if (!existingStream.getTracks().some((existingTrack) => existingTrack.id === track.id)) {
+          console.log(`[${remoteId}] Adding track to stream:`, track.kind, track.id);
+          existingStream.addTrack(track);
+        }
+      });
+
+      if (e.track && !existingStream.getTracks().some((track) => track.id === e.track.id)) {
+        console.log(`[${remoteId}] Adding single track:`, e.track.kind, e.track.id);
+        existingStream.addTrack(e.track);
+      }
+
+      console.log(`[${remoteId}] Final stream tracks:`, existingStream.getTracks().map(t => `${t.kind}(${t.id})`));
+      upsertPeer(remoteId, { stream: existingStream, username: remoteName });
+    };
+
+    pc.onnegotiationneeded = () => {
+      void negotiatePeer(remoteId);
     };
 
     pc.onconnectionstatechange = () => {
@@ -311,7 +409,7 @@ export default function Room() {
       socket.on("all-users", async (users) => {
         for (const { socketId, username: uname } of users) {
           const pc = createPeerConnection(socketId, uname);
-          upsertPeer(socketId, { pc, username: uname });
+          upsertPeer(socketId, { pc, username: uname, isOfferer: true });
           const offer = await pc.createOffer();
           await pc.setLocalDescription({
             type: offer.type,
@@ -326,8 +424,9 @@ export default function Room() {
 
       // 2. Existing user receives newcomer's offer
       socket.on("user-joined", async ({ signal, callerId, username: uname }) => {
+        console.log("[SocketIO] Received user-joined from", callerId, uname);
         const pc = createPeerConnection(callerId, uname);
-        upsertPeer(callerId, { pc, username: uname });
+        upsertPeer(callerId, { pc, username: uname, isOfferer: false });
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
         await flushQueuedIceCandidates(callerId);
         const answer = await pc.createAnswer();
@@ -335,6 +434,7 @@ export default function Room() {
           type: answer.type,
           sdp: preferHighQualityAudio(answer.sdp),
         });
+        console.log("[SocketIO] Sending answer to", callerId);
         socket.emit("returning-signal", {
           callerId,
           signal: pc.localDescription,
@@ -343,10 +443,12 @@ export default function Room() {
 
       // 3. Newcomer receives the answer
       socket.on("receiving-returned-signal", async ({ signal, id }) => {
+        console.log("[SocketIO] Received answer from", id);
         const pc = peersRef.current[id]?.pc;
         if (pc) {
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
           await flushQueuedIceCandidates(id);
+          console.log("[SocketIO] Answer set for", id);
         }
       });
 
@@ -372,6 +474,8 @@ export default function Room() {
       socket.off("user-left");
       Object.values(peersRef.current).forEach((p) => p.pc && p.pc.close());
       peersRef.current = {};
+      Object.values(peerStreamsRef.current).forEach((stream) => stream?.getTracks().forEach((t) => t.stop()));
+      peerStreamsRef.current = {};
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
       micTrackRef.current?.stop();
@@ -400,7 +504,7 @@ export default function Room() {
         await refreshSharedAudio(false);
       } else {
         const placeholderTrack = getPlaceholderAudioTrack();
-        replaceAudioTrackOnAllPeers(placeholderTrack);
+        await replaceAudioTrackOnAllPeers(placeholderTrack);
         setLocalTracks(localStreamRef.current?.getVideoTracks()[0], placeholderTrack);
       }
       return;
@@ -414,7 +518,7 @@ export default function Room() {
       if (sharing) {
         await refreshSharedAudio(true);
       } else {
-        replaceAudioTrackOnAllPeers(micTrack);
+        await replaceAudioTrackOnAllPeers(micTrack);
         setLocalTracks(localStreamRef.current?.getVideoTracks()[0], micTrack);
       }
     } catch (err) {
@@ -422,36 +526,57 @@ export default function Room() {
     }
   };
 
-  const replaceVideoTrackOnAllPeers = (newTrack) => {
-    Object.values(peersRef.current).forEach(({ pc }) => {
-      if (!pc) return;
-      const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-      if (sender) sender.replaceTrack(newTrack);
-    });
+  const replaceVideoTrackOnAllPeers = async (newTrack) => {
+    console.log("[ReplaceVideo] Starting replacement with track:", newTrack?.kind, newTrack?.id);
+    await Promise.all(
+      Object.entries(peersRef.current).map(async ([remoteId, { pc }]) => {
+        if (!pc) return;
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+        if (sender) {
+          console.log(`[${remoteId}] Replacing video sender:`, sender.track?.id, "→", newTrack?.id);
+          await sender.replaceTrack(newTrack);
+        } else {
+          console.log(`[${remoteId}] No video sender found, adding track:`, newTrack?.id);
+          pc.addTrack(newTrack, localStreamRef.current || new MediaStream([newTrack]));
+        }
+        console.log(`[${remoteId}] Negotiating after video replacement`);
+        await negotiatePeer(remoteId);
+      }),
+    );
   };
-  const replaceAudioTrackOnAllPeers = (newTrack) => {
+
+  const replaceAudioTrackOnAllPeers = async (newTrack) => {
     if (!newTrack) return;
-    Object.values(peersRef.current).forEach(({ pc }) => {
-      if (!pc) return;
-      const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
-      if (sender) {
-        sender.replaceTrack(newTrack).then(() => tuneAudioSender(sender));
-      } else {
-        tuneAudioSender(
-          pc.addTrack(newTrack, localStreamRef.current || new MediaStream([newTrack])),
-        );
-      }
-    });
+    await Promise.all(
+      Object.entries(peersRef.current).map(async ([remoteId, { pc }]) => {
+        if (!pc) return;
+        const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
+        if (sender) {
+          await sender.replaceTrack(newTrack);
+          tuneAudioSender(sender);
+        } else {
+          tuneAudioSender(
+            pc.addTrack(newTrack, localStreamRef.current || new MediaStream([newTrack])),
+          );
+        }
+        await negotiatePeer(remoteId);
+      }),
+    );
   };
 
   const startScreenShare = async () => {
     try {
+      console.log("[ScreenShare] Starting screen share");
       const screen = await navigator.mediaDevices.getDisplayMedia(DISPLAY_MEDIA_OPTIONS);
       screenStreamRef.current = screen;
       const screenVideoTrack = screen.getVideoTracks()[0];
-      const screenAudioTrack = screen.getAudioTracks()[0]; // undefined if nothing was shared
+      const screenAudioTrack = screen.getAudioTracks()[0];
       screenAudioTrackRef.current = screenAudioTrack || null;
       setScreenAudioStatus(screenAudioTrack ? "captured" : "missing");
+      console.log("[ScreenShare] Got screen stream:", {
+        video: screenVideoTrack?.id,
+        audio: screenAudioTrack?.id,
+      });
 
       if (screenAudioTrack?.applyConstraints) {
         try {
@@ -463,7 +588,8 @@ export default function Room() {
 
       cameraTrackRef.current = localStreamRef.current?.getVideoTracks()[0] || null;
 
-      replaceVideoTrackOnAllPeers(screenVideoTrack);
+      console.log("[ScreenShare] Replacing video tracks on all peers");
+      await replaceVideoTrackOnAllPeers(screenVideoTrack);
 
       if (!screenAudioTrack) {
         console.warn(
@@ -473,13 +599,19 @@ export default function Room() {
       }
 
       const outgoingAudioTrack = await createSharedAudioTrack(micOn);
-      replaceAudioTrackOnAllPeers(outgoingAudioTrack);
+      console.log("[ScreenShare] Replacing audio tracks on all peers");
+      await replaceAudioTrackOnAllPeers(outgoingAudioTrack);
       setLocalTracks(screenVideoTrack, outgoingAudioTrack);
       setSharing(true);
+      console.log("[ScreenShare] Screen share active");
 
-      screenVideoTrack.onended = () => stopScreenShare();
+      screenVideoTrack.onended = () => {
+        console.log("[ScreenShare] Video track ended by user");
+        stopScreenShare();
+      };
       if (screenAudioTrack) {
         screenAudioTrack.onended = () => {
+          console.log("[ScreenShare] Audio track ended by user");
           if (!screenStreamRef.current) return;
           screenAudioTrackRef.current = null;
           setScreenAudioStatus("missing");
@@ -508,7 +640,7 @@ export default function Room() {
         camTrack = null;
       }
     }
-    if (camTrack) replaceVideoTrackOnAllPeers(camTrack);
+    if (camTrack) await replaceVideoTrackOnAllPeers(camTrack);
 
     let outgoingAudioTrack = getPlaceholderAudioTrack();
     if (micOn) {
@@ -522,7 +654,7 @@ export default function Room() {
       micTrackRef.current.enabled = false;
     }
 
-    replaceAudioTrackOnAllPeers(outgoingAudioTrack);
+    await replaceAudioTrackOnAllPeers(outgoingAudioTrack);
     setLocalTracks(camTrack, outgoingAudioTrack);
     setSharing(false);
   };

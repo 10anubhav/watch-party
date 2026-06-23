@@ -9,28 +9,18 @@ const roomsRouter = require("./routes/rooms");
 
 const PORT = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
-const ALLOWED_ORIGINS = Array.from(
-  new Set([
-    CLIENT_URL,
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    ...(process.env.CLIENT_ORIGINS
-      ? process.env.CLIENT_ORIGINS.split(",").map((origin) => origin.trim()).filter(Boolean)
-      : []),
-  ]),
-);
 const MONGO_URI =
   process.env.MONGO_URI || "mongodb://localhost:27017/watchparty";
 
 const app = express();
-app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
+app.use(cors({ origin: CLIENT_URL, credentials: true }));
 app.use(express.json());
 app.use("/", roomsRouter);
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] },
+  cors: { origin: CLIENT_URL, methods: ["GET", "POST"] },
 });
 
 // roomId -> Map(socketId -> username)
