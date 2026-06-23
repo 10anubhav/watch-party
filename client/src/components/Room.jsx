@@ -450,6 +450,7 @@ export default function Room() {
       screenVideoTrack.onended = () => stopScreenShare();
       if (screenAudioTrack) {
         screenAudioTrack.onended = () => {
+          if (!screenStreamRef.current) return;
           screenAudioTrackRef.current = null;
           setScreenAudioStatus("missing");
           refreshSharedAudio(micOn);
