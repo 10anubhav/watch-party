@@ -70,6 +70,7 @@ export default function Room() {
   const [copied, setCopied] = useState(false);
 
   const peersRef = useRef({}); // mirror of peers state for sync access
+  const pendingIceRef = useRef({}); // socketId -> RTCIceCandidateInit[]
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const screenAudioTrackRef = useRef(null);
@@ -87,6 +88,7 @@ export default function Room() {
   const removePeer = (id) => {
     const p = peersRef.current[id];
     if (p?.pc) p.pc.close();
+    delete pendingIceRef.current[id];
     delete peersRef.current[id];
     setPeers({ ...peersRef.current });
   };
@@ -172,6 +174,34 @@ export default function Room() {
     });
   };
 
+  const addOrQueueIceCandidate = async (from, candidate) => {
+    const pc = peersRef.current[from]?.pc;
+    if (!pc || !candidate) return;
+
+    if (!pc.remoteDescription) {
+      pendingIceRef.current[from] = pendingIceRef.current[from] || [];
+      pendingIceRef.current[from].push(candidate);
+      return;
+    }
+
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.warn("addIceCandidate failed", err);
+    }
+  };
+
+  const flushQueuedIceCandidates = async (id) => {
+    const pc = peersRef.current[id]?.pc;
+    const queued = pendingIceRef.current[id] || [];
+    if (!pc || !pc.remoteDescription || queued.length === 0) return;
+
+    delete pendingIceRef.current[id];
+    for (const candidate of queued) {
+      await addOrQueueIceCandidate(id, candidate);
+    }
+  };
+
   const closeMixedAudio = () => {
     if (audioContextRef.current) {
       audioContextRef.current.close();
@@ -226,6 +256,12 @@ export default function Room() {
   };
 
   const createPeerConnection = (remoteId, remoteName) => {
+    const existingPc = peersRef.current[remoteId]?.pc;
+    if (existingPc && existingPc.connectionState !== "closed") {
+      upsertPeer(remoteId, { username: remoteName });
+      return existingPc;
+    }
+
     const pc = new RTCPeerConnection(ICE_SERVERS);
 
     // Push our local tracks
@@ -243,7 +279,8 @@ export default function Room() {
     };
 
     pc.ontrack = (e) => {
-      upsertPeer(remoteId, { stream: e.streams[0], username: remoteName });
+      const stream = e.streams[0] || new MediaStream([e.track]);
+      upsertPeer(remoteId, { stream, username: remoteName });
     };
 
     pc.onconnectionstatechange = () => {
@@ -270,28 +307,21 @@ export default function Room() {
       setMicOn(false);
       setLocalStream(stream);
 
-      socket.connect();
-      socket.emit("join-room", { roomId, username });
-
       // 1. Existing users list -> we (newcomer) create offers to each
-      socket.on("all-users", (users) => {
-        users.forEach(({ socketId, username: uname }) => {
+      socket.on("all-users", async (users) => {
+        for (const { socketId, username: uname } of users) {
           const pc = createPeerConnection(socketId, uname);
           upsertPeer(socketId, { pc, username: uname });
-          pc.createOffer()
-            .then((offer) =>
-              pc.setLocalDescription({
-                type: offer.type,
-                sdp: preferHighQualityAudio(offer.sdp),
-              }),
-            )
-            .then(() => {
-              socket.emit("sending-signal", {
-                userToSignal: socketId,
-                signal: pc.localDescription,
-              });
-            });
-        });
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription({
+            type: offer.type,
+            sdp: preferHighQualityAudio(offer.sdp),
+          });
+          socket.emit("sending-signal", {
+            userToSignal: socketId,
+            signal: pc.localDescription,
+          });
+        }
       });
 
       // 2. Existing user receives newcomer's offer
@@ -299,6 +329,7 @@ export default function Room() {
         const pc = createPeerConnection(callerId, uname);
         upsertPeer(callerId, { pc, username: uname });
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
+        await flushQueuedIceCandidates(callerId);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription({
           type: answer.type,
@@ -313,22 +344,21 @@ export default function Room() {
       // 3. Newcomer receives the answer
       socket.on("receiving-returned-signal", async ({ signal, id }) => {
         const pc = peersRef.current[id]?.pc;
-        if (pc) await pc.setRemoteDescription(new RTCSessionDescription(signal));
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal));
+          await flushQueuedIceCandidates(id);
+        }
       });
 
       // ICE
       socket.on("ice-candidate", async ({ from, candidate }) => {
-        const pc = peersRef.current[from]?.pc;
-        if (pc && candidate) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          } catch (e) {
-            console.warn("addIceCandidate failed", e);
-          }
-        }
+        await addOrQueueIceCandidate(from, candidate);
       });
 
       socket.on("user-left", ({ socketId }) => removePeer(socketId));
+
+      if (!socket.connected) socket.connect();
+      socket.emit("join-room", { roomId, username });
     };
 
     init();
