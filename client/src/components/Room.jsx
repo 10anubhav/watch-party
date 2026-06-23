@@ -237,8 +237,13 @@ export default function Room() {
     }
 
     pc.onicecandidate = (e) => {
+      console.log("SENDING ICE", e.candidate);
+
       if (e.candidate) {
-        socket.emit("ice-candidate", { to: remoteId, candidate: e.candidate });
+        socket.emit("ice-candidate", {
+          to: remoteId,
+          candidate: e.candidate,
+        });
       }
     };
 
@@ -285,6 +290,7 @@ export default function Room() {
 
       // 1. Existing users list -> we (newcomer) create offers to each
       socket.on("all-users", (users) => {
+        console.log("ALL USERS", users);
         users.forEach(({ socketId, username: uname }) => {
           const pc = createPeerConnection(socketId, uname);
           upsertPeer(socketId, { pc, username: uname });
@@ -306,6 +312,7 @@ export default function Room() {
 
       // 2. Existing user receives newcomer's offer
       socket.on("user-joined", async ({ signal, callerId, username: uname }) => {
+        console.log("ALL USERS", users);
         const pc = createPeerConnection(callerId, uname);
         upsertPeer(callerId, { pc, username: uname });
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
@@ -322,6 +329,7 @@ export default function Room() {
 
       // 3. Newcomer receives the answer
       socket.on("receiving-returned-signal", async ({ signal, id }) => {
+        console.log("RECEIVED ANSWER");
         const pc = peersRef.current[id]?.pc;
         if (pc) await pc.setRemoteDescription(new RTCSessionDescription(signal));
       });
