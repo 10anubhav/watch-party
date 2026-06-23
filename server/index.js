@@ -76,15 +76,17 @@ io.on("connection", (socket) => {
 
   // ICE candidates (both directions)
   socket.on("ice-candidate", ({ to, candidate }) => {
-    io.to(to).emit("ice-candidate", { from: socket.id, candidate });
-  });
+    console.log(
+      "ICE FORWARD",
+      socket.id,
+      "->",
+      to,
+      candidate?.candidate
+    );
 
-  // Chat -------------------------------------------------------------
-  socket.on("chat-message", ({ roomId, text }) => {
-    io.to(roomId).emit("chat-message", {
-      username: socket.data.username,
-      text,
-      ts: Date.now(),
+    io.to(to).emit("ice-candidate", {
+      from: socket.id,
+      candidate,
     });
   });
 

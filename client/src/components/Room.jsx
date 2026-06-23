@@ -336,7 +336,7 @@ export default function Room() {
 
       // ICE
       socket.on("ice-candidate", async ({ from, candidate }) => {
-        console.log("RECEIVED ICE", from);
+        console.log("RECEIVED ICE", from, candidate);
 
         const pc = peersRef.current[from]?.pc;
 
