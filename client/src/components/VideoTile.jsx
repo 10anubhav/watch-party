@@ -86,7 +86,8 @@ export default function VideoTile({ stream, username, muted = false, isLocal }) 
       {needsAudioUnlock && !isLocal && (
         <button
           onClick={enableAudio}
-          className="absolute inset-x-3 bottom-10 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium hover:bg-indigo-500"
+          className="absolute inset-x-3 bottom-10 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium hover:bg-indigo
+-500"
         >
           Enable audio
         </button>
@@ -98,14 +99,16 @@ export default function VideoTile({ stream, username, muted = false, isLocal }) 
         className="absolute top-2 right-2 p-1.5 rounded-md bg-black/60 hover:bg-black/80 transition-colors"
       >
         {isFullscreen ? (
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="roun
+d" strokeLinejoin="round">
             <path d="M8 3v3a2 2 0 0 1-2 2H3" />
             <path d="M21 8h-3a2 2 0 0 1-2-2V3" />
             <path d="M3 16h3a2 2 0 0 1 2 2v3" />
             <path d="M16 21v-3a2 2 0 0 1 2-2h3" />
           </svg>
         ) : (
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="roun
+d" strokeLinejoin="round">
             <path d="M8 3H5a2 2 0 0 0-2 2v3" />
             <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
             <path d="M3 16v3a2 2 0 0 0 2 2h3" />
