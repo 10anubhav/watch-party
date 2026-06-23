@@ -256,14 +256,13 @@ export default function Room() {
     };
 
     pc.onconnectionstatechange = () => {
+      console.log("Connection State:", pc.connectionState);
+
       if (
         ["failed", "disconnected", "closed"].includes(pc.connectionState)
       ) {
         // keep entry; user-left handler will clean up
       }
-    };
-    pc.onconnectionstatechange = () => {
-      console.log("Connection State:", pc.connectionState);
     };
 
     pc.oniceconnectionstatechange = () => {
@@ -312,7 +311,7 @@ export default function Room() {
 
       // 2. Existing user receives newcomer's offer
       socket.on("user-joined", async ({ signal, callerId, username: uname }) => {
-        console.log("ALL USERS", users);
+        console.log("USER JOINED EVENT", callerId);
         const pc = createPeerConnection(callerId, uname);
         upsertPeer(callerId, { pc, username: uname });
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
