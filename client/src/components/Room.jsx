@@ -243,7 +243,11 @@ export default function Room() {
     };
 
     pc.ontrack = (e) => {
-      upsertPeer(remoteId, { stream: e.streams[0], username: remoteName });
+      console.log("TRACK RECEIVED", remoteId);
+      upsertPeer(remoteId, {
+        stream: e.streams[0],
+        username: remoteName,
+      });
     };
 
     pc.onconnectionstatechange = () => {
@@ -253,7 +257,13 @@ export default function Room() {
         // keep entry; user-left handler will clean up
       }
     };
+    pc.onconnectionstatechange = () => {
+      console.log("Connection State:", pc.connectionState);
+    };
 
+    pc.oniceconnectionstatechange = () => {
+      console.log("ICE State:", pc.iceConnectionState);
+    };
     return pc;
   };
 
