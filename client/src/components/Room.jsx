@@ -312,14 +312,21 @@ export default function Room() {
       // 2. Existing user receives newcomer's offer
       socket.on("user-joined", async ({ signal, callerId, username: uname }) => {
         console.log("USER JOINED EVENT", callerId);
+
         const pc = createPeerConnection(callerId, uname);
         upsertPeer(callerId, { pc, username: uname });
-        await pc.setRemoteDescription(new RTCSessionDescription(signal));
+
+        await pc.setRemoteDescription(
+          new RTCSessionDescription(signal)
+        );
+
         const answer = await pc.createAnswer();
+
         await pc.setLocalDescription({
           type: answer.type,
           sdp: preferHighQualityAudio(answer.sdp),
         });
+
         socket.emit("returning-signal", {
           callerId,
           signal: pc.localDescription,
