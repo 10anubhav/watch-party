@@ -336,7 +336,10 @@ export default function Room() {
 
       // ICE
       socket.on("ice-candidate", async ({ from, candidate }) => {
+        console.log("RECEIVED ICE", from);
+
         const pc = peersRef.current[from]?.pc;
+
         if (pc && candidate) {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
