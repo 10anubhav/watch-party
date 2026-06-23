@@ -12,6 +12,50 @@ const ICE_SERVERS = {
   ],
 };
 
+const MEDIA_AUDIO_CONSTRAINTS = {
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+  channelCount: { ideal: 2 },
+  sampleRate: { ideal: 48000 },
+};
+
+const DISPLAY_MEDIA_OPTIONS = {
+  video: { frameRate: 30 },
+  audio: {
+    ...MEDIA_AUDIO_CONSTRAINTS,
+    suppressLocalAudioPlayback: false,
+  },
+};
+
+const preferHighQualityAudio = (sdp) => {
+  if (!sdp) return sdp;
+
+  return sdp.replace(/a=fmtp:(\d+) ([^\r\n]*)/g, (line, payload, params) => {
+    const rtpmap = new RegExp(`a=rtpmap:${payload} opus/48000`, "i");
+    if (!rtpmap.test(sdp)) return line;
+
+    const values = new Map(
+      params
+        .split(";")
+        .map((param) => param.trim())
+        .filter(Boolean)
+        .map((param) => {
+          const [key, ...rest] = param.split("=");
+          return [key, rest.join("=") || "1"];
+        }),
+    );
+
+    values.set("stereo", "1");
+    values.set("sprop-stereo", "1");
+    values.set("maxaveragebitrate", "510000");
+    values.set("useinbandfec", "1");
+    values.set("usedtx", "0");
+
+    return `a=fmtp:${payload} ${Array.from(values, ([key, value]) => `${key}=${value}`).join(";")}`;
+  });
+};
+
 export default function Room() {
   const { roomId } = useParams();
   const navigate = useNavigate();
@@ -30,6 +74,7 @@ export default function Room() {
   const cameraTrackRef = useRef(null); // remember original camera track during screen share
   const micTrackRef = useRef(null);
   const audioContextRef = useRef(null);
+  const silentAudioContextRef = useRef(null);
 
   // ---- Helpers --------------------------------------------------------
   const upsertPeer = (id, data) => {
@@ -43,13 +88,88 @@ export default function Room() {
     setPeers({ ...peersRef.current });
   };
 
+  const createSilentAudioTrack = () => {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return null;
+
+    const ctx = new AudioContext();
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const destination = ctx.createMediaStreamDestination();
+
+    gain.gain.value = 0;
+    oscillator.connect(gain);
+    gain.connect(destination);
+    oscillator.start();
+
+    silentAudioContextRef.current = ctx;
+    const [track] = destination.stream.getAudioTracks();
+    track.enabled = false;
+    return track;
+  };
+
+  const ensureAudioTrack = (stream) => {
+    const existingTrack = stream.getAudioTracks()[0];
+    if (existingTrack) return existingTrack;
+
+    const silentTrack = createSilentAudioTrack();
+    if (silentTrack) stream.addTrack(silentTrack);
+    return silentTrack;
+  };
+
+  const getInitialLocalStream = async () => {
+    const tracks = [];
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: MEDIA_AUDIO_CONSTRAINTS,
+      });
+      stream.getTracks().forEach((track) => tracks.push(track));
+    } catch (err) {
+      console.warn("Camera/mic together failed; trying separately.", err);
+
+      try {
+        const videoOnly = await navigator.mediaDevices.getUserMedia({ video: true });
+        videoOnly.getVideoTracks().forEach((track) => tracks.push(track));
+      } catch (videoErr) {
+        console.warn("Camera access failed.", videoErr);
+      }
+
+      try {
+        const audioOnly = await navigator.mediaDevices.getUserMedia({
+          audio: MEDIA_AUDIO_CONSTRAINTS,
+        });
+        audioOnly.getAudioTracks().forEach((track) => tracks.push(track));
+      } catch (audioErr) {
+        console.warn("Mic access failed.", audioErr);
+      }
+    }
+
+    const stream = new MediaStream(tracks);
+    ensureAudioTrack(stream);
+    return stream;
+  };
+
+  const tuneAudioSender = (sender) => {
+    if (!sender) return;
+
+    const params = sender.getParameters();
+    params.encodings = params.encodings?.length ? params.encodings : [{}];
+    params.encodings[0].maxBitrate = 510000;
+    sender.setParameters(params).catch((err) => {
+      console.warn("Unable to apply high-quality audio sender parameters.", err);
+    });
+  };
+
   const createPeerConnection = (remoteId, remoteName) => {
     const pc = new RTCPeerConnection(ICE_SERVERS);
 
     // Push our local tracks
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
+        const sender = pc.addTrack(track, localStreamRef.current);
+        if (track.kind === "audio") tuneAudioSender(sender);
       });
     }
 
@@ -79,18 +199,13 @@ export default function Room() {
     let cancelled = false;
 
     const init = async () => {
-      let stream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
-      } catch (err) {
-        alert("Camera/mic access denied. You can still chat.");
-        stream = new MediaStream();
-      }
+      const stream = await getInitialLocalStream();
       if (cancelled) return;
       localStreamRef.current = stream;
+      cameraTrackRef.current = stream.getVideoTracks()[0] || null;
+      micTrackRef.current = stream.getAudioTracks()[0] || null;
+      setCamOn(!!cameraTrackRef.current);
+      setMicOn(!!micTrackRef.current && micTrackRef.current.enabled);
       setLocalStream(stream);
 
       socket.connect();
@@ -102,7 +217,12 @@ export default function Room() {
           const pc = createPeerConnection(socketId, uname);
           upsertPeer(socketId, { pc, username: uname });
           pc.createOffer()
-            .then((offer) => pc.setLocalDescription(offer))
+            .then((offer) =>
+              pc.setLocalDescription({
+                type: offer.type,
+                sdp: preferHighQualityAudio(offer.sdp),
+              }),
+            )
             .then(() => {
               socket.emit("sending-signal", {
                 userToSignal: socketId,
@@ -118,7 +238,10 @@ export default function Room() {
         upsertPeer(callerId, { pc, username: uname });
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
         const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        await pc.setLocalDescription({
+          type: answer.type,
+          sdp: preferHighQualityAudio(answer.sdp),
+        });
         socket.emit("returning-signal", {
           callerId,
           signal: pc.localDescription,
@@ -159,6 +282,8 @@ export default function Room() {
       peersRef.current = {};
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+      audioContextRef.current?.close();
+      silentAudioContextRef.current?.close();
       socket.disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -173,7 +298,7 @@ export default function Room() {
   };
 
   const toggleMic = () => {
-    const track = localStreamRef.current?.getAudioTracks()[0];
+    const track = micTrackRef.current;
     if (!track) return;
     track.enabled = !track.enabled;
     setMicOn(track.enabled);
@@ -187,22 +312,34 @@ export default function Room() {
     });
   };
   const replaceAudioTrackOnAllPeers = (newTrack) => {
+    if (!newTrack) return;
     Object.values(peersRef.current).forEach(({ pc }) => {
       if (!pc) return;
       const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
-      if (sender) sender.replaceTrack(newTrack);
+      if (sender) {
+        sender.replaceTrack(newTrack).then(() => tuneAudioSender(sender));
+      } else {
+        tuneAudioSender(
+          pc.addTrack(newTrack, localStreamRef.current || new MediaStream([newTrack])),
+        );
+      }
     });
   };
 
   const startScreenShare = async () => {
     try {
-      const screen = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 30 },
-        audio: true,
-      });
+      const screen = await navigator.mediaDevices.getDisplayMedia(DISPLAY_MEDIA_OPTIONS);
       screenStreamRef.current = screen;
       const screenVideoTrack = screen.getVideoTracks()[0];
       const screenAudioTrack = screen.getAudioTracks()[0]; // undefined if nothing was shared
+
+      if (screenAudioTrack?.applyConstraints) {
+        try {
+          await screenAudioTrack.applyConstraints(MEDIA_AUDIO_CONSTRAINTS);
+        } catch (err) {
+          console.warn("Unable to apply full-quality screen audio constraints.", err);
+        }
+      }
 
       cameraTrackRef.current = localStreamRef.current?.getVideoTracks()[0] || null;
       micTrackRef.current = localStreamRef.current?.getAudioTracks()[0] || null;
@@ -215,16 +352,23 @@ export default function Room() {
         // Mix your mic + the shared tab/system audio into one track,
         // so your friend hears the movie AND you talking, on the same
         // audio channel that's already connected (no renegotiation needed).
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const destination = ctx.createMediaStreamDestination();
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (AudioContext) {
+          const ctx = new AudioContext();
+          await ctx.resume();
+          const destination = ctx.createMediaStreamDestination();
 
-        if (micTrackRef.current) {
-          ctx.createMediaStreamSource(new MediaStream([micTrackRef.current])).connect(destination);
+          if (micTrackRef.current && micTrackRef.current.readyState !== "ended") {
+            ctx.createMediaStreamSource(new MediaStream([micTrackRef.current])).connect(destination);
+          }
+          ctx.createMediaStreamSource(new MediaStream([screenAudioTrack])).connect(destination);
+
+          audioContextRef.current = ctx;
+          outgoingAudioTrack = destination.stream.getAudioTracks()[0];
+        } else {
+          outgoingAudioTrack = screenAudioTrack;
         }
-        ctx.createMediaStreamSource(new MediaStream([screenAudioTrack])).connect(destination);
-
-        audioContextRef.current = ctx;
-        outgoingAudioTrack = destination.stream.getAudioTracks()[0];
+        outgoingAudioTrack.enabled = true;
       } else {
         console.warn(
           "No audio was captured from the share — your friend will only hear your mic, not the movie. " +
@@ -270,10 +414,13 @@ export default function Room() {
       try {
         const fresh = await navigator.mediaDevices.getUserMedia({ audio: true });
         micTrack = fresh.getAudioTracks()[0];
+        micTrackRef.current = micTrack;
       } catch {
-        micTrack = null;
+        micTrack = createSilentAudioTrack();
+        micTrackRef.current = micTrack;
       }
     }
+    if (micTrack) micTrack.enabled = micOn;
     if (micTrack) replaceAudioTrackOnAllPeers(micTrack);
 
     const newLocal = new MediaStream([camTrack, micTrack].filter(Boolean));

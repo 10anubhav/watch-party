@@ -4,10 +4,22 @@ export default function VideoTile({ stream, username, muted = false, isLocal }) 
   const videoRef = useRef(null);
   const containerRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
 
   useEffect(() => {
-    if (videoRef.current && stream) videoRef.current.srcObject = stream;
-  }, [stream]);
+    const video = videoRef.current;
+    if (!video || !stream) return;
+
+    video.srcObject = stream;
+    video.muted = muted;
+
+    const playPromise = video.play();
+    if (playPromise?.catch) {
+      playPromise
+        .then(() => setNeedsAudioUnlock(false))
+        .catch(() => setNeedsAudioUnlock(!muted));
+    }
+  }, [stream, muted]);
 
   useEffect(() => {
     const onChange = () => {
@@ -45,6 +57,19 @@ export default function VideoTile({ stream, username, muted = false, isLocal }) 
     }
   };
 
+  const enableAudio = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    video.muted = false;
+    try {
+      await video.play();
+      setNeedsAudioUnlock(false);
+    } catch (err) {
+      console.warn("Unable to start remote audio playback.", err);
+    }
+  };
+
   return (
     <div
       ref={containerRef}
@@ -57,6 +82,15 @@ export default function VideoTile({ stream, username, muted = false, isLocal }) 
         muted={muted}
         className={`w-full h-full ${isFullscreen ? "object-contain bg-black" : "object-cover"}`}
       />
+
+      {needsAudioUnlock && !isLocal && (
+        <button
+          onClick={enableAudio}
+          className="absolute inset-x-3 bottom-10 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium hover:bg-indigo-500"
+        >
+          Enable audio
+        </button>
+      )}
 
       <button
         onClick={toggleFullscreen}
